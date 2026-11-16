@@ -22,7 +22,9 @@ History
 # Standard Python modules
 # =============================================================================
 import os
+import sys
 import time
+import multiprocessing as mp
 from copy import copy, deepcopy
 import pickle as pkl
 from collections.abc import Iterable
@@ -686,6 +688,10 @@ class CMPLXFOIL(BaseSolver):
         h : float
             Step sized used when the mode is "FD" or "CS" (must be complex
             if mode = "CS")
+
+        The "numSensProcs" option can be used to spread the design variable loop below
+        across multiple processes on a single machine (mode="CS" only, see that option's
+        description for details/caveats).
         """
         # This is the one and only gateway to the getting derivatives
         # out of xfoil. If you want a derivative, it should come from
@@ -713,21 +719,27 @@ class CMPLXFOIL(BaseSolver):
                 else:
                     funcsSens[self.curAP.name + "_" + f][dvName] = np.zeros(1)
 
-        # Loop over design variables and compute derivatives of each
+        # Build one seed (xDvDot dict) per scalar design variable component
+        jobs = []
         for dvName, dvVal in DVs.items():
             lenDV = 1 if not isinstance(dvVal, np.ndarray) else len(dvVal)
             for i in range(lenDV):
-                # Compute the seed for the finite difference/complex step
                 seed = {dvName: np.zeros(dvVal.shape, dtype=float)}
                 seed[dvName][i] = 1.0
+                jobs.append((dvName, i, seed))
 
-                # Compute the sensitivity
-                sens = self.computeJacobianVectorProductFwd(xDvDot=seed, mode=mode, h=h)
-                for f in evalFuncs:
-                    funcsSens[self.curAP.name + "_" + f][dvName][i] = sens[f]
+        # Compute the sensitivity of every job, optionally spread across multiple processes
+        results = self._computeJacVecProdBatch([{"xDvDot": job[2]} for job in jobs], mode=mode, h=h)
 
-                # Check that the solution converged
-                self.checkSolutionFailure(self.curAP, funcsSens)
+        failed = False
+        for (dvName, i, _), (sens, jobFailed) in zip(jobs, results):
+            for f in evalFuncs:
+                funcsSens[self.curAP.name + "_" + f][dvName][i] = sens[f]
+            failed = failed or jobFailed
+
+        # Check that the solution converged (aggregated across all of the jobs above)
+        self.curAP.solveFailed = self.curAP.fatalFail = failed
+        self.checkSolutionFailure(self.curAP, funcsSens)
 
         # Append "_" + (current aero problem name) to any design variables associated with the aero problem
         for f in evalFuncs:
@@ -828,6 +840,153 @@ class CMPLXFOIL(BaseSolver):
             self.setCoordinatesComplex(orig_coords)
 
         return jacVecProd
+
+    def _computeJacVecProdBatch(self, jobs, mode, h):
+        """
+        Compute ``computeJacobianVectorProductFwd`` for a batch of perturbations, optionally
+        spreading the work across multiple processes on this machine (see the "numSensProcs" option).
+
+        Parameters
+        ----------
+        jobs : list of dict
+            One kwargs dict per requested jacobian-vector product, e.g. ``{"xDvDot": {...}}`` or
+            ``{"xSDot": array}``, passed straight through as ``computeJacobianVectorProductFwd(**job)``
+        mode : str ["FD" or "CS"]
+            Passed through to computeJacobianVectorProductFwd
+        h : float or None
+            Passed through to computeJacobianVectorProductFwd
+
+        Returns
+        -------
+        list of (dict, bool)
+            For each job (in the same order given), the jacVecProd dict and whether that
+            solve failed (``solveFailed`` or ``fatalFail``)
+        """
+        numProcs = self._getNumSensProcs(mode, len(jobs))
+
+        if numProcs <= 1:
+            results = []
+            for job in jobs:
+                sens = self.computeJacobianVectorProductFwd(mode=mode, h=h, **job)
+                results.append((sens, bool(self.curAP.solveFailed or self.curAP.fatalFail)))
+            return results
+
+        # Split the jobs into numProcs contiguous chunks and solve each chunk in its own forked
+        # child process. Forking (rather than spawning a fresh interpreter) is what makes this cheap
+        # and safe: each child inherits the already-loaded xfoil_cs module and DVGeo state directly
+        # from this process's memory, so there is no extra shared-library load and nothing needs to
+        # be pickled to launch the work (only the small result payload is pickled, on the way back).
+        ctx = mp.get_context("fork")
+        chunks = [c for c in np.array_split(np.arange(len(jobs)), numProcs) if len(c) > 0]
+
+        procs = []
+        parentConns = []
+        for chunk in chunks:
+            chunkJobs = [jobs[i] for i in chunk]
+            parentConn, childConn = ctx.Pipe(duplex=False)
+            proc = ctx.Process(target=self._sensWorker, args=(chunkJobs, mode, h, childConn))
+            proc.start()
+            childConn.close()  # only the child needs its end open
+            procs.append(proc)
+            parentConns.append(parentConn)
+
+        results = [None] * len(jobs)
+        for proc, conn, chunk in zip(procs, parentConns, chunks):
+            try:
+                payload = conn.recv()
+            except EOFError:
+                payload = None
+            proc.join()
+            conn.close()
+
+            if payload is None:
+                raise RuntimeError(
+                    "A worker process computing design variable sensitivities died unexpectedly "
+                    f"(exit code {proc.exitcode}) before returning a result. This is likely a crash "
+                    "inside XFOIL rather than in the Python wrapper."
+                )
+            status, data = payload
+            if status == "error":
+                raise RuntimeError(f"A worker process computing design variable sensitivities failed: {data}")
+
+            for idx, res in zip(chunk, data):
+                results[idx] = res
+
+        return results
+
+    def _sensWorker(self, jobs, mode, h, conn):
+        """
+        Run in a forked child process (see _computeJacVecProdBatch): compute a batch of jacobian
+        vector products and send the results back to the parent through ``conn``. This method must
+        never return normally or raise past the try/finally below, since falling through to the
+        normal Python interpreter shutdown in a forked child would re-run this (still-referenced)
+        CMPLXFOIL instance's cleanup code (e.g. MExt deleting the shared library copy the parent is
+        still using), so it always exits with os._exit() instead.
+        """
+        try:
+            results = []
+            for job in jobs:
+                sens = self.computeJacobianVectorProductFwd(mode=mode, h=h, **job)
+                results.append((sens, bool(self.curAP.solveFailed or self.curAP.fatalFail)))
+            conn.send(("ok", results))
+        except Exception as e:
+            try:
+                conn.send(("error", str(e)))
+            except Exception:
+                pass
+        finally:
+            conn.close()
+            os._exit(0)
+
+    def _getNumSensProcs(self, mode, numJobs):
+        """
+        Determine how many processes to use for the current sensitivity batch, honoring the
+        "numSensProcs" option and validating that parallel execution is safe to attempt right now.
+
+        Parameters
+        ----------
+        mode : str ["FD" or "CS"]
+            Sensitivity mode requested by the caller
+        numJobs : int
+            Number of jacobian-vector products about to be computed
+
+        Returns
+        -------
+        int
+            The number of processes to actually use (1 means run serially in this process)
+        """
+        numProcs = self.getOption("numSensProcs")
+        if numProcs <= 1:
+            return 1
+
+        if mode != "CS":
+            raise ValueError(
+                f'The "numSensProcs" option (> 1) is only supported for mode="CS", not mode="{mode}". '
+                'Use mode="CS" or set the "numSensProcs" option back to 1.'
+            )
+
+        if not sys.platform.startswith("linux"):
+            raise OSError(
+                'The "numSensProcs" option relies on Linux\'s fork() and is not supported on this '
+                'platform. Set the "numSensProcs" option to 1.'
+            )
+
+        if not self.getOption("allowSensProcsWithMPI"):
+            try:
+                from mpi4py import MPI
+
+                mpiActive = MPI.COMM_WORLD.Get_size() > 1
+            except ImportError:
+                mpiActive = False
+            if mpiActive:
+                raise RuntimeError(
+                    'Refusing to fork worker processes for "numSensProcs" > 1 while running under MPI '
+                    "with more than one rank: forking inside an active MPI process is unsafe with some "
+                    "MPI transports (e.g. InfiniBand). If you have verified this is safe on your MPI "
+                    'installation, set the "allowSensProcsWithMPI" option to True to override this check.'
+                )
+
+        return min(numProcs, numJobs, os.cpu_count() or 1)
 
     def getTriangulatedMeshSurface(self, offsetDist=1.0):
         """
@@ -1126,6 +1285,12 @@ class CMPLXFOIL(BaseSolver):
             ],  # boundary layer trip x coordinate of upper and lower surface, respectively (two-element array)
             "nCrit": [float, 9.0],
             "rhoKS": [float, 500.0],  # KS aggregation parameter used for computing ``kscpmin``
+            # Number of processes to use for evalFunctionsSens's design variable loop (mode="CS" only).
+            # Relies on Linux's fork(), so it is a no-op error on other platforms. Values > 1 are refused
+            # while running under MPI with more than one rank unless "allowSensProcsWithMPI" is also set,
+            # since forking inside an active MPI process is unsafe with some MPI transports.
+            "numSensProcs": [int, 1],
+            "allowSensProcsWithMPI": [bool, False],  # override the "numSensProcs" MPI safety check above
         }
 
     @staticmethod

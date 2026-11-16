@@ -8,6 +8,8 @@ from cmplxfoil import CMPLXFOIL
 # Standard Python Modules
 # =============================================================================
 import os
+import sys
+import types
 
 # =============================================================================
 # External Python modules
@@ -488,6 +490,115 @@ class TestDerivativesCST(unittest.TestCase):
 
             # Check evalFunctionsSens's methods against each other
             np.testing.assert_allclose(actualSensFD, actualSensCS, rtol=relTol, atol=absTol)
+
+
+class TestParallelSens(unittest.TestCase):
+    """Check that the numSensProcs > 1 fork-based path reproduces the serial results exactly."""
+
+    def setUp(self):
+        self.CFDSolverSerial = CMPLXFOIL(
+            os.path.join(baseDir, "naca0012.dat"),
+            options={"printRealConvergence": False, "numSensProcs": 1},
+        )
+        self.CFDSolverParallel = CMPLXFOIL(
+            os.path.join(baseDir, "naca0012.dat"),
+            options={"printRealConvergence": False, "numSensProcs": 4},
+        )
+        for cfdSolver in [self.CFDSolverSerial, self.CFDSolverParallel]:
+            ap = AeroProblem(
+                name="fc",
+                alpha=1.5,
+                mach=0.3,
+                reynolds=1e6,
+                reynoldsLength=1.0,
+                T=288.15,
+                areaRef=1.0,
+                chordRef=1.0,
+                evalFuncs=cfdSolver.functionList,
+            )
+            ap.addDV("alpha", value=1.5, lower=0.0, upper=10.0, scale=1.0)
+            cfdSolver(ap)
+            cfdSolver.curAP_forTest = ap  # stash for use in tests below
+
+    def test_batch_matches_serial(self):
+        """Several distinct (scaled) seeds should give identical, correctly-ordered results whether
+        or not they are split across forked worker processes."""
+        magnitudes = [1.0, 2.0, -1.0, 0.5, 3.0, -2.0]
+        jobs = [{"xDvDot": {"alpha": np.array([m])}} for m in magnitudes]
+
+        serial = self.CFDSolverSerial._computeJacVecProdBatch(jobs, mode="CS", h=None)
+        parallel = self.CFDSolverParallel._computeJacVecProdBatch(jobs, mode="CS", h=None)
+
+        for (sensSerial, failSerial), (sensParallel, failParallel) in zip(serial, parallel):
+            self.assertEqual(failSerial, failParallel)
+            for f in self.CFDSolverSerial.functionList:
+                np.testing.assert_allclose(sensSerial[f], sensParallel[f], rtol=1e-10)
+
+    def test_evalFunctionsSens_end_to_end(self):
+        """The public evalFunctionsSens API should give the same answer regardless of numSensProcs."""
+        funcsSensSerial = {}
+        self.CFDSolverSerial.evalFunctionsSens(self.CFDSolverSerial.curAP_forTest, funcsSensSerial, mode="CS")
+        funcsSensParallel = {}
+        self.CFDSolverParallel.evalFunctionsSens(self.CFDSolverParallel.curAP_forTest, funcsSensParallel, mode="CS")
+        self.assertEqual(set(funcsSensSerial.keys()), set(funcsSensParallel.keys()))
+        for key in funcsSensSerial:
+            if key == "fail":
+                self.assertEqual(funcsSensSerial[key], funcsSensParallel[key])
+                continue
+            for dvName in funcsSensSerial[key]:
+                np.testing.assert_allclose(funcsSensSerial[key][dvName], funcsSensParallel[key][dvName], rtol=1e-10)
+
+    def test_batch_supports_xSDot_jobs(self):
+        """_computeJacVecProdBatch should also work with raw xSDot coordinate perturbations,
+        not just xDvDot-based AeroProblem/DVGeo design variables (used for shape parameterizations
+        that don't go through DVGeo, e.g. hand-rolled bump functions)."""
+        rng = np.random.default_rng(0)
+        coordShape = self.CFDSolverSerial.coords0.shape
+        jobs = [{"xSDot": rng.normal(size=coordShape) * 1e-3} for _ in range(5)]
+
+        serial = self.CFDSolverSerial._computeJacVecProdBatch(jobs, mode="CS", h=None)
+        parallel = self.CFDSolverParallel._computeJacVecProdBatch(jobs, mode="CS", h=None)
+
+        for (sensSerial, failSerial), (sensParallel, failParallel) in zip(serial, parallel):
+            self.assertEqual(failSerial, failParallel)
+            for f in self.CFDSolverSerial.functionList:
+                np.testing.assert_allclose(sensSerial[f], sensParallel[f], rtol=1e-10)
+
+    def test_numSensProcs_rejects_FD(self):
+        with self.assertRaises(ValueError):
+            self.CFDSolverParallel._computeJacVecProdBatch([{"xDvDot": {"alpha": np.array([1.0])}}], mode="FD", h=None)
+
+    def test_numSensProcs_refuses_under_active_mpi(self):
+        """Simulate an active multi-rank MPI communicator and check that numSensProcs > 1 is refused
+        unless the user explicitly opts in with allowSensProcsWithMPI."""
+        fakeMPIModule = types.ModuleType("mpi4py.MPI")
+
+        class FakeComm:
+            def Get_size(self):
+                return 4
+
+        fakeMPIModule.COMM_WORLD = FakeComm()
+        fakeMpi4py = types.ModuleType("mpi4py")
+        fakeMpi4py.MPI = fakeMPIModule
+
+        jobs = [{"xDvDot": {"alpha": np.array([1.0])}}]
+        origModules = {k: sys.modules.get(k) for k in ["mpi4py", "mpi4py.MPI"]}
+        sys.modules["mpi4py"] = fakeMpi4py
+        sys.modules["mpi4py.MPI"] = fakeMPIModule
+        try:
+            with self.assertRaises(RuntimeError):
+                self.CFDSolverParallel._computeJacVecProdBatch(jobs, mode="CS", h=None)
+
+            self.CFDSolverParallel.setOption("allowSensProcsWithMPI", True)
+            result = self.CFDSolverParallel._computeJacVecProdBatch(jobs, mode="CS", h=None)
+            self.assertIn("cl", result[0][0])
+        finally:
+            self.CFDSolverParallel.setOption("allowSensProcsWithMPI", False)
+            for k, v in origModules.items():
+                if v is None:
+                    sys.modules.pop(k, None)
+                else:
+                    sys.modules[k] = v
 
 
 class TestPlotting(unittest.TestCase):
