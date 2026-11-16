@@ -110,7 +110,12 @@ class CMPLXFOIL(BaseSolver):
         # Dictionary with dictionary of functions for each aero problem
         self.funcs = {}
         self.funcsComplex = {}
-        self.functionList = ["cl", "cd", "cdp", "cm", "kscpmin"]  # available functions
+        # available functions:
+        #   cl, cd, cdp, cm: lift, drag, pressure drag, and moment coefficients
+        #   kscpmin: KS-aggregated minimum pressure coefficient
+        #   ld: lift-to-drag ratio (cl / cd)
+        #   xtrupper, xtrlower: boundary layer transition location (x/c) on the upper/lower surface
+        self.functionList = ["cl", "cd", "cdp", "cm", "kscpmin", "ld", "xtrupper", "xtrlower"]
 
         # When the XFOIL solver is called, slice data is saved (key is the current
         # AeroProblem name). In the associated value is a dictionary containing
@@ -344,6 +349,11 @@ class CMPLXFOIL(BaseSolver):
         )
         kscpmin = -self.computeKSMax(-cpAll, rho=self.getOption("rhoKS"))
         funcs[aeroProblem.name]["kscpmin"] = dtype(kscpmin)
+
+        # Lift-to-drag ratio and boundary layer transition locations, useful objectives/constraints for foil design
+        funcs[aeroProblem.name]["ld"] = funcs[aeroProblem.name]["cl"] / funcs[aeroProblem.name]["cd"]
+        funcs[aeroProblem.name]["xtrupper"] = dtype(xfoil.cr15.xoctr[0])
+        funcs[aeroProblem.name]["xtrlower"] = dtype(xfoil.cr15.xoctr[1])
 
         # Check for failure
         self.curAP.solveFailed = self.curAP.fatalFail = xfoil.cl01.lexitflag != 0 or xfoil.cl01.lvconv == 0
