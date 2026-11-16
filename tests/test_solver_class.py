@@ -104,6 +104,45 @@ class TestNACA(unittest.TestCase):
             self.assertAlmostEqual(true_val, funcs[key])
 
 
+class TestJacVecProdPerturbations(unittest.TestCase):
+    """Check which combinations of perturbation arguments computeJacobianVectorProductFwd accepts."""
+
+    def setUp(self):
+        self.CFDSolver = CMPLXFOIL(
+            os.path.join(baseDir, "naca0012.dat"),
+            options={"printRealConvergence": False},
+        )
+        self.ap = AeroProblem(
+            name="fc",
+            alpha=1.5,
+            mach=0.3,
+            reynolds=1e6,
+            reynoldsLength=1.0,
+            T=288.15,
+            areaRef=1.0,
+            chordRef=1.0,
+            evalFuncs=self.CFDSolver.functionList,
+        )
+        self.CFDSolver(self.ap)
+
+    def test_xSDot_only(self):
+        """A surface (xSDot) perturbation on its own is a documented input and must not require
+        xDvDot to also be given, including when no DVGeo object is set."""
+        xSDot = np.zeros_like(self.CFDSolver.coords0)
+        xSDot[:, 1] = 1e-3  # perturb the y coordinate of every surface point
+
+        jacVecProd = self.CFDSolver.computeJacobianVectorProductFwd(xSDot=xSDot, mode="CS")
+
+        for f in self.CFDSolver.functionList:
+            self.assertIn(f, jacVecProd)
+            self.assertTrue(np.isfinite(jacVecProd[f]))
+
+    def test_both_none_raises(self):
+        """Giving neither perturbation is still an error."""
+        with self.assertRaises(ValueError):
+            self.CFDSolver.computeJacobianVectorProductFwd(mode="CS")
+
+
 class TestTransition(unittest.TestCase):
     def setUp(self):
         self.cmplxfoilOptions = {"printRealConvergence": False}

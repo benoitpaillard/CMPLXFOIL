@@ -763,6 +763,8 @@ class CMPLXFOIL(BaseSolver):
         """
         if xDvDot is None and xSDot is None:
             raise ValueError("xDvDot and xSDot cannot both be None")
+        if xDvDot is None:
+            xDvDot = {}
 
         if mode not in ["FD", "CS"]:
             raise ValueError(f'Jacobian vector product mode "{mode}" invalid. Must be either "FD" or "CS"')
@@ -791,7 +793,7 @@ class CMPLXFOIL(BaseSolver):
         # For the geometric xDvDot perturbation we accumulate into the
         # already existing (and possibly nonzero) xsdot and xvdot
         geoxDvDot = {k: xDvDot[k] for k in geoDVs if k in xDvDot}
-        if xDvDot is not None and self.DVGeo is not None:
+        if geoxDvDot and self.DVGeo is not None:
             xsdot += self.DVGeo.totalSensitivityProd(geoxDvDot, self.curAP.ptSetName, config=self.curAP.name).reshape(
                 xsdot.shape
             )
